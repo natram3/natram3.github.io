@@ -1,0 +1,135 @@
+---
+title: "Santa Clara County Educational Attainment Indicators"
+output: flexdashboard::flex_dashboard
+---
+
+```{r global, include=F}
+knitr::opts_chunk$set(echo = TRUE)
+library(flexdashboard)
+library(tidyverse)
+library(leaflet)
+library(plotly)
+library(devtools)
+devtools::install_github("jamgreen/lehdr")
+library(readxl)
+library(tigris)
+library(sf)
+library(lehdr)
+Sys.setenv(CENSUS_KEY="c8aa67e4086b4b5ce3a8717f59faa9a28f611dab")
+
+scc_per_change <- readRDS("scc_per_change.rds")
+scc_pums_example <- readRDS("scc_pums_example.rds")
+scc_pums <- readRDS("scc_pums.rds")
+scc_pumas <- readRDS("scc_pumas.rds")
+```
+
+Column
+-------------------------------------
+
+The map below shows discrepancies of up to 9% in between adjacent geographic 
+areas in SCC. Interestingly, the center of San Jose has a lower percentage of 
+students without internet access--this analysis can be extended more broadly 
+to identify if it is a pattern. These discrepancies point to the difficulties 
+of transitioning to remote learning for a small percentage of K-12 students. 
+These discrepancies may indicate compounding inequities for this subset of 
+students (secure housing, financial stability, presence of caregivers at home). 
+This map is an initial dive into persisting educational disparities. To help 
+inform funding priorities regarding internet access, a more specific and 
+comprehensive analysis would be of use.
+
+### % K-12 Student Internet Access
+
+```{r, echo=F}
+scc_pums_example <-
+  scc_pums %>% 
+  filter(!duplicated(SERIALNO)) %>% 
+  mutate(
+    internet_access = ifelse(
+      (ACCESS %in% c("1","2")),
+      PWGTP,
+      0
+    )
+  ) %>% 
+  group_by(PUMA) %>% 
+  summarize(
+    perc_no_internet =
+      (100 - sum(internet_access, na.rm =T)/sum(PWGTP, na.rm = T)*100)
+  ) %>% 
+  left_join(
+    scc_pumas %>% 
+      select(PUMACE10),
+    by = c("PUMA" = "PUMACE10")
+  ) %>% 
+  st_as_sf()
+
+pums_pal <- colorNumeric(
+  palette = "plasma",
+  domain = scc_pums_example$perc_no_internet
+)
+
+leaflet() %>%
+  addTiles() %>% 
+  addPolygons(
+    data = scc_pums_example,
+    fillColor = ~pums_pal(perc_no_internet),
+    color = "white",
+    opacity = 0.5,
+    fillOpacity = 0.5,
+    weight = 1,
+    label = ~paste0(
+      round(perc_no_internet), 
+      "% K-12 students without internet access"
+    ),
+    highlightOptions = highlightOptions(
+      weight = 2,
+      opacity = 1
+    )
+  ) %>% 
+  addLegend(
+    data = scc_pums_example,
+    pal = pums_pal,
+    values = ~perc_no_internet,
+    title = "% K-12 students<br>without internet access<br>in Santa Clara County"
+  )
+```
+
+Column
+-------------------------------------
+
+This graph shows the percent change across educational outcomes, from high 
+school graduates to 4-year college graduates, broken down by race for Santa 
+Clara county (SCC). The Asian population in SCC has 
+the greatest percent change out of any racial group; yet, are many 
+disparities between different Asian communities based on ethnicity (e.g. 
+Southeast Asian and East Asian communities), that this graph’s data set (ACS) 
+lacks. The negative percent changes for the Indigenous populations in SCC is 
+concerning. There is a clear discrepancy in education attainment between 
+Indigenous groups and other racial groups, at least in terms of higher 
+education, and the causes are complex. Info on how this dashboard 
+was made: http://github.com/natram3/natram3.github.io/blob/master/R-9.rmd
+
+
+### % Change From High School Graduates to Bachelor’s Degrees
+
+
+```{r, echo=F}
+scc_per_change %>% 
+  ggplot() +
+  geom_bar(
+    aes(
+      x = race %>% factor(),
+      y = change2,
+      fill = race
+    ),
+    stat = "identity",
+    position = "stack"
+  ) +
+  labs(
+    x = "Race",
+    y = "% Change",
+    title = "% Change from High School Graduates to Bachelor's",
+    fill = "Race"
+  ) + 
+  coord_flip() + 
+  theme(legend.position = "bottom", legend.direction = "vertical")
+```
