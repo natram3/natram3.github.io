@@ -105,8 +105,8 @@ Southeast Asian and East Asian communities), that this graph’s data set (ACS)
 lacks. The negative percent changes for the Indigenous populations in SCC is 
 concerning. There is a clear discrepancy in education attainment between 
 Indigenous groups and other racial groups, at least in terms of higher 
-education, and the causes are complex. Info on how this dashboard 
-was made: http://github.com/natram3/natram3.github.io/blob/master/R-9.rmd
+education, and the causes are complex. Code for this dashboard: 
+http://github.com/natram3/natram3.github.io/blob/master/R-9.rmd
 
 
 ### % Change From High School Graduates to Bachelor’s Degrees
