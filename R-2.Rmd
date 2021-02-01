@@ -1,0 +1,520 @@
+---
+title: "R-2"
+output: html_document
+---
+An analysis of education outcomes in Santa Clara county (SCC) and the Bay Area
+
+```{r libraries, include=FALSE}
+knitr::opts_chunk$set(echo = T, warning = F, message = F)
+library(tidyverse)
+library(sf)
+library(tigris)
+library(leaflet)
+library(censusapi)
+library(tidycensus)
+ca_counties <- counties("CA", cb = T, progress_bar = F)
+bay_county_names <-
+  c(
+    "Alameda",
+    "Contra Costa",
+    "Marin",
+    "Napa",
+    "San Francisco",
+    "San Mateo",
+    "Santa Clara",
+    "Solano",
+    "Sonoma"
+  )
+bay_counties <-
+  ca_counties %>%
+  filter(NAME %in% bay_county_names)
+
+Sys.setenv(CENSUS_KEY="c8aa67e4086b4b5ce3a8717f59faa9a28f611dab")
+```
+
+Importing 2018 and 2019 ACS 5-year data sets.
+``` {r acs and pums setup, include=FALSE}
+Sys.setenv(CENSUS_KEY="601675c683d8379131e78a304b3e5f7d209edca3")
+
+acs_vars_2018_5yr <-
+  listCensusMetadata(
+    name = "2018/acs/acs5",
+    type = "variables"
+  )
+saveRDS(acs_vars_2018_5yr,"acs_vars_2018_5yr.rds")
+
+  acs_vars_2019_1yr <-
+  listCensusMetadata(
+    name = "2019/acs/acs1",
+    type = "variables"
+  )
+saveRDS(acs_vars_2019_1yr,"acs_vars_2019_1yr.rds")
+
+
+temp <- tempfile()
+download.file("https://www2.census.gov/programs-surveys/acs/data/pums/2018/5-Year/csv_hca.zip",destfile = temp, mode = "wb")
+
+pums_hca_2018_5yr <- read_csv(unzip(temp,"psam_h06.csv"))
+
+unlink(temp)
+
+census_api_key("601675c683d8379131e78a304b3e5f7d209edca3", install=TRUE, overwrite=TRUE)
+
+
+pums_vars_2018 <- 
+  pums_variables %>%
+  filter(year == 2018, survey == "acs5")
+saveRDS(pums_vars_2018,"pums_vars_2018.rds")
+
+pums_vars_2018_distinct_hh <- 
+  pums_vars_2018 %>%
+  distinct(var_code, var_label, data_type, level) %>% 
+  filter(level == "housing")
+saveRDS(pums_vars_2018_distinct_hh,"pums_vars_2018_distinct_hh.rds")
+
+```
+
+```{r}
+census_api_key("601675c683d8379131e78a304b3e5f7d209edca3", overwrite=TRUE, install=TRUE) 
+
+ca_pums2 <- get_pums(
+  variables = c(
+    "PUMA",
+    "NP",
+    "HHL",
+    "HINCP",
+    "ACCESS",
+    "SCHG"
+  ),
+  state = "CA",
+  survey = "acs5",
+  recode = T
+)
+saveRDS(ca_pums2, "ca_pums2.rds")
+options(tigris_use_cache = TRUE)
+```
+
+I select for Santa Clara county education attainment data, in particular looking at the percent change in those being high school graduates and those attaining Bachelor's degrees per racial group. In this analysis, I did not look at the "Some other race alone" or "Two or more races" groups so I could get a clearer look at the racial groups that do have smaller populations in Santa Clara county, particularly Black & Indigenous populations.
+
+```{r county set-up}
+census_race_labels <- 
+  c(
+    "White Alone",
+    "Black or African American",
+    "American Indian and Alaska Native Alone",
+    "Asian Alone",
+    "Native Hawaiian and Other Pacific Islander Alone"
+    # "Some Other Race Alone",
+    # "Two or More Races"
+  )
+
+scc_educ_race <-
+  1:7 %>% 
+  map_dfr(function(x) {
+  getCensus(
+    name = "acs/acs5",
+    vintage = 2018,
+    region = "county:085",
+    regionin = "state:06",
+    vars = paste0("group(C15002", LETTERS[x],")") 
+  ) %>%
+  select(!c(GEO_ID,state,NAME) & !ends_with(c("EA","MA","M"))) %>%
+  pivot_longer(
+    ends_with("E"),
+    names_to = "variable",
+    values_to = "estimate"
+  ) %>%
+  left_join(
+    acs_vars_2018_5yr %>% 
+      select(name, label), 
+    by = c("variable" = "name")
+  ) %>% 
+  select(-variable) %>% 
+  separate(
+    label,
+    into = c(NA,NA,"sex","education"),
+    sep = "!!"
+  ) %>% 
+  filter(!is.na(sex)) %>% 
+  filter(!is.na(education)) %>% 
+  mutate(race = census_race_labels[x])
+  })
+scc_educ_race <- filter(scc_educ_race, !is.na(race))
+
+scc_per_change <- scc_educ_race %>% 
+  filter(education != "Less than high school diploma" & education != "Some college or associate's degree") %>%
+  group_by(education, race) %>%
+  summarize(estimate = sum(estimate))
+
+scc_per_change <- scc_per_change[order(scc_per_change$race),] 
+
+scc_per_change$change <- ave(scc_per_change$estimate, scc_per_change$race, FUN=function(x) c(0, diff(x)))
+scc_per_change$change <- scc_per_change$change * -1
+scc_per_change <- scc_per_change %>% mutate(change2 = change / estimate * 100)
+
+```
+
+The Santa Clara county Educational Attainment graph, proportioned by race, yields a couple interesting trends. One is that the Asian demographic is the only one to have a higher population of those with Bachelor's degrees than less than a high school education. However, this is not  a clear insight because of the various disparities within the Asian demographic, particularly when it comes to Southeast Asians. As discussed below, the technology industry and (post)-college educated immigrants may be influencing these trends. Population by demographic could yield more insight into why the proportion of the Asian demographic is the only one to decrease so much from "less than high school diploma" and the two categories "high school graduate" and "some college or associate's degree."
+
+``` {r graph 1}
+scc_race_total <-
+  scc_educ_race %>% 
+  group_by(race) %>% 
+  summarize(estimate = sum(estimate)) %>% 
+  mutate(education = "Total")
+
+scc_educ_race %>% 
+  group_by(education,race) %>% 
+  summarize(estimate = sum(estimate)) %>% 
+  rbind(scc_race_total) %>% 
+  ggplot() +
+  geom_bar(
+    aes(
+      x = education %>% factor(levels = rev(c("Total",scc_educ_race$education[1:4]))),
+      y = estimate,
+      fill = race
+    ),
+    stat = "identity",
+    position = "fill"
+  ) +
+  labs(
+    x = "Educational Attainment",
+    y = "Proportion of people",
+    title = "Santa Clara County Educational Attainment by Race",
+    fill = "Race"
+  ) + 
+  coord_flip() + 
+  theme(legend.position = "bottom", legend.direction = "vertical")
+
+scc_educ_race %>% 
+  group_by(education,race) %>% 
+  summarize(estimate = sum(estimate)) %>% 
+  rbind(scc_race_total) %>% 
+  ggplot() +
+  geom_bar(
+    aes(
+      x = education %>% factor(levels = rev(c("Total",scc_educ_race$education[1:4]))),
+      y = estimate,
+      fill = race
+    ),
+    stat = "identity",
+    position = "stack"
+  ) +
+  labs(
+    x = "Educational Attainment",
+    y = "Number of people",
+    title = "Santa Clara County Educational Attainment by Race",
+    fill = "Race"
+  ) + 
+  coord_flip() + 
+  theme(legend.position = "bottom", legend.direction = "vertical")
+```
+
+The following graph shows that the Asian population in SCC has a much higher population of Bachelor's attaining individuals than any other racial group (by 590%).
+The population has a positive change of 231% from high school graduates to Bachelor's degree-holders.
+The percent change for the Asian population may be due to a large population of immigrant workers from Asia who come to SCC already holding Bachelor's degrees, or those who came ot the US for their undergraduate degree. The technology industry in particular is known for hiring foreign-born workers through the H-1B visa for specialty workers.
+The Black population has a 108% change, while the American Indian and Alaska Native alone populations have a -47% change, and the Native Hawaiian and other Pacific Islander alone populations have a -43% change. 
+The percent change for the Black population suggest is half that of the White population, although it is just high enough to suggest that the proportion of Bachelor's degree-holders to high school graduates is increasing, which seems like a positive indicator.
+
+However, the percent changes for the various Indigenous populations in SCC is quite concerning, as it is a negative change. One possibility is that the population of Indigenous Bachelor's degree-holders is decreasing relative to those who are high school graduates. This could be due to natural deaths, although that number might be small, the SCC Indigenous population size is small to begin with. 
+A more plausible explanation could be that the number of Indigenous peoples in SCC graduating from high school is increasing at a higher rate than that of those attaining Bachelor's degrees. From this data set, it is difficult to tell if there are an outsized number of Indigenous peoples in college in SCC, or if they are not going to college. Upon comparison to other racial groups, it is clear that there is a major discrepancy in education attainment between Indigenous groups and other racial groups, at least in terms of higher education.
+
+```{r graph 2}
+scc_per_change %>% 
+  ggplot() +
+  geom_bar(
+    aes(
+      x = race %>% factor(),
+      y = change2,
+      fill = race
+    ),
+    stat = "identity",
+    position = "stack"
+  ) +
+  labs(
+    x = "Race",
+    y = "% Change",
+    title = "% Change from High School Graduates to Bachelor's",
+    fill = "Race"
+  ) + 
+  coord_flip() + 
+  theme(legend.position = "bottom", legend.direction = "vertical")
+```
+
+``` {r internet set-up2}
+ca_pumas <-
+  pumas("CA", cb = T, progress_bar = F)
+
+scc <- bay_counties %>% filter(COUNTYFP == "085")
+
+scc_pumas <-
+  ca_pumas %>% 
+  st_centroid() %>% 
+  .[scc, ] %>% 
+  st_set_geometry(NULL) %>% 
+  left_join(ca_pumas %>% select(GEOID10)) %>% 
+  st_as_sf()
+
+scc_pums <-
+  ca_pums2 %>% 
+  filter(
+    PUMA %in% scc_pumas$PUMACE10)
+
+scc_pums <- scc_pums %>% filter(SCHG %in% c("02","03","04","05","06","07","08","09","10","11","12","13","14"),
+                                ACCESS != "b")
+```
+
+There are an estimated 6,685 K-12 students without internet access in SCC, or 3.48% of K-12 students in SCC.
+Note: these results come from data that are a snapshot of recent conditions in SCC, weighted according to ACS/PUMAS methodology. 
+
+While this may be a small percentage of K-12 students, a more specific analysis must be conducted to better understand where these students are, and what factors are in play regarding internet access.
+```{r internet access answer}
+scc_pums_none <- scc_pums %>% 
+  filter(!duplicated(SERIALNO)) %>% 
+  mutate(
+    no_internet = ifelse(
+      (ACCESS == "3"),
+      PWGTP,
+      0
+    )
+  ) %>% 
+  summarize(
+    total = sum(no_internet),
+    percent = sum(no_internet) / sum(PWGTP) * 100
+  )
+scc_pums_none$total
+scc_pums_none$percent
+
+```
+
+```{r internet graph 3}
+ca_pumas <-
+  pumas("CA", cb = T, progress_bar = F)
+
+bay_pumas <-
+  ca_pumas %>% 
+  st_centroid() %>% 
+  .[bay_counties, ] %>% 
+  st_set_geometry(NULL) %>% 
+  left_join(ca_pumas %>% select(GEOID10)) %>% 
+  st_as_sf()
+
+bay_pums2 <-
+  ca_pums2 %>% 
+  filter(
+    PUMA %in% bay_pumas$PUMACE10)
+
+bay_pums2 <- bay_pums2 %>% filter(SCHG %in% c("02","03","04","05","06","07","08","09","10","11","12","13","14"),
+                                ACCESS != "b")
+bay_pums_example <-
+  bay_pums2 %>% 
+  filter(!duplicated(SERIALNO)) %>% 
+  mutate(
+    internet_access = ifelse(
+      (ACCESS %in% c("1","2")),
+      PWGTP,
+      0
+    )
+  ) %>% 
+  group_by(PUMA) %>% 
+  summarize(
+    perc_no_internet =
+      (100 - sum(internet_access, na.rm =T)/sum(PWGTP, na.rm = T)*100)
+  ) %>% 
+  left_join(
+    bay_pumas %>% 
+      select(PUMACE10),
+    by = c("PUMA" = "PUMACE10")
+  ) %>% 
+  st_as_sf()
+
+pums_pal <- colorNumeric(
+  palette = "plasma",
+  domain = bay_pums_example$perc_no_internet
+)
+
+leaflet() %>%
+  addTiles() %>% 
+  addPolygons(
+    data = bay_pums_example,
+    fillColor = ~pums_pal(perc_no_internet),
+    color = "white",
+    opacity = 0.5,
+    fillOpacity = 0.5,
+    weight = 1,
+    label = ~paste0(
+      round(perc_no_internet), 
+      "% K-12 students without internet access"
+    ),
+    highlightOptions = highlightOptions(
+      weight = 2,
+      opacity = 1
+    )
+  ) %>% 
+  addLegend(
+    data = bay_pums_example,
+    pal = pums_pal,
+    values = ~perc_no_internet,
+    title = "% K-12 students<br>without internet access"
+  )
+```
+The graph above shows discrepancies of up to 18% in between adjacent PUMAs.
+Interestingly, areas within and/or near city centers had a higher % of students without internet access (e.g., Oakland, inner San Jose, in between San Leandro and Oakland). 
+These discrepancies point to the difficulties of transitioning to remote learning for a small percentage of K-12 students. Considering the otherwise prevalence of internet access for K-12 students in the Bay Area, barriers to internet access may additionally complicate remote learning for these students without internet access (secure housing, financial stability, presence of caregivers at home). 
+This map presents an important look at general discrepancies, and could help inform funding priorities for areas with a significant percentage of K-12 students without internet access. 
+However, comprehensive solutions to this problem would require a more specific analysis. 
+
+``` {r mobility set-up}
+bay_mobility_current_19 <- 
+  getCensus(
+    name = "acs/acs1",
+    vintage = 2019,
+    region = "county:085",
+    regionin = "state:06",
+    vars = c("group(B07009)")
+  ) %>% 
+  select(!c(GEO_ID,state,NAME) & !ends_with(c("EA","MA","M"))) %>%
+  pivot_longer(
+    ends_with("E"),
+    names_to = "variable",
+    values_to = "estimate"
+  ) %>%
+  left_join(
+    acs_vars_2019_1yr %>% 
+      select(name, label), 
+    by = c("variable" = "name")
+  ) %>% 
+  select(-variable) %>% 
+  separate(
+    label,
+    into = c(NA,NA,"mobility","education"),
+    sep = "!!"
+  ) %>% 
+    mutate(
+    mobility = ifelse(
+      mobility %in% c("Same house 1 year ago:", "Moved within same county:"),
+      "Here since last year",
+      "Inflow"
+    )
+  ) %>% 
+  filter(!is.na(education)) %>% 
+  group_by(mobility, education) %>% 
+  summarize(estimate = sum(estimate))
+
+bay_mobility_lastyear_19 <- 
+  getCensus(
+    name = "acs/acs1",
+    vintage = 2019,
+    region = "county:085",
+    regionin = "state:06",
+    vars = c("group(B07409)")
+  ) %>% 
+  select(!c(GEO_ID,state,NAME) & !ends_with(c("EA","MA","M"))) %>%
+  pivot_longer(
+    ends_with("E"),
+    names_to = "variable",
+    values_to = "estimate"
+  ) %>%
+  left_join(
+    acs_vars_2019_1yr %>% 
+      select(name, label), 
+    by = c("variable" = "name")
+  ) %>% 
+  select(-variable) %>% 
+  separate(
+    label,
+    into = c(NA,NA,"mobility","education"),
+    sep = "!!"
+  ) %>% 
+  mutate(
+    mobility = ifelse(
+      mobility %in% c("Same house:", "Moved within same county:"),
+      "Here since last year",
+      "Outflow"
+    )
+  ) %>% 
+  filter(!is.na(education)) %>% 
+  group_by(mobility, education) %>% 
+  summarize(estimate = sum(estimate))
+
+bay_mobility_current_18 <- 
+  getCensus(
+    name = "acs/acs1",
+    vintage = 2018,
+    region = "county:085",
+    regionin = "state:06",
+    vars = c("group(B07009)")
+  ) %>% 
+  select(!c(GEO_ID,state,NAME) & !ends_with(c("EA","MA","M"))) %>%
+  pivot_longer(
+    ends_with("E"),
+    names_to = "variable",
+    values_to = "estimate"
+  ) %>%
+  left_join(
+    acs_vars_2019_1yr %>% 
+      select(name, label), 
+    by = c("variable" = "name")
+  ) %>% 
+  select(-variable) %>% 
+  separate(
+    label,
+    into = c(NA,NA,"mobility","education"),
+    sep = "!!"
+  ) %>% 
+  mutate(
+    mobility = "Here last year"
+  ) %>% 
+  filter(!is.na(education)) %>% 
+  group_by(mobility, education) %>% 
+  summarize(estimate = sum(estimate))
+```
+
+```{r educ mobility calc and table}
+bay_flows_19 <-
+  rbind(
+    bay_mobility_current_18,
+    bay_mobility_lastyear_19 %>% 
+      filter(mobility == "Outflow"),
+    bay_mobility_current_19 %>% 
+      filter(mobility == "Inflow"),
+    bay_mobility_current_19 %>% 
+      group_by(education) %>% 
+      summarize(estimate = sum(estimate)) %>% 
+      mutate(mobility = "Here this year")
+  ) %>% 
+  pivot_wider(
+    names_from = mobility,
+    values_from = estimate
+  ) %>% 
+  mutate(
+    `External net` = Inflow - Outflow,
+    `Internal net` = `Here this year` - `Here last year` - `External net`,
+  ) %>% 
+  select(
+    `Education tier` = education, 
+    `Internal net`,
+    `External net`,
+    `Here last year`, 
+    `Here this year`, 
+    Outflow, 
+    Inflow
+  )
+  
+df1 <- slice(bay_flows_19, 4:3)
+df2 <- slice(bay_flows_19, 5)
+df3 <- slice(bay_flows_19, 1:2)
+
+bay_flows_19 <- rbind(df1,df2,df3)
+bay_flows_19
+
+```
+Less than high school graduate: This category saw a 3,600 population increase, with (net) 180 people leaving, resulting in a 3,780 internal increase. The increase here seems to be mostly due to birth rates, which could be counteracting the population of people becoming high school graduates.
+
+High school graduate: This category saw a +1,179 population change, with (net) 1,123 people moving in as a high school graduate. Interestingly, there is an internal net gain of only 56 people in SCC. Considering that many adults are high school graduates, death rates may be outweighing the graduating high school classes of SCC, resulting in an internal net change close to 0. Another important factor could be high school graduates entering into the "some college or associate's degree" category.
+
+Some college or associate's degree: This category saw a -3,275 population change, with (net) -3,394 migration. The small 119 internal increase suggests that there is a small group of people graduating and attaining their associate's degrees, or dropping out of college. The relatively small internal increase also suggets that there may be a large portion of this population attaining their Bachelor's degrees.
+
+Bachelor's degree: This category saw a -4,615 population change, with only a net migration of -236, resulting in a -4,379 internal population change There may be several reasons for this internal loss. SCC has a few graduate universities (Stanford, Santa Clara, San Jose State, etc.), so this internal loss could be due to those with Bachelor's degrees attaining graduate degrees. However, the internal net loss for the graduate or professional degree category is even larger than this category, so this is not likely to be a primary cause of internal loss. Another reason may be death rates, as many older adults could have Bachelor's degrees. A compounding factor may be people with Bachelor's degrees moving abroad, and thus not being accounted for through the ACS.
+
+Graduate or professional degree: This category saw a +4,023 population change, with an (net) influx of 10,166 people. As explained in the equity analysis of this report, the technology industry in SCC is known to bring in foreign-born workers with Bachelor's degrees or higher, particularly through the H-1B visa program. Even then, there is an internal net loss of -6,143 people with graduate or professional degrees. Death rates may also be at play here, but this seems like a significantly large number for that to be the sole explanation. Given the international and fast-moving nature of the technology industry, loss due to moving abroad may also be a factor here, too.
